@@ -1,0 +1,209 @@
+---
+title: "Modeling Tornadoes"
+output: html_document
+date: "2023-05-27"
+editor_options: 
+  chunk_output_type: console
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+Installing libraries.       
+```{r}
+library(tidyverse)
+library(tidytuesdayR)
+library(scales)
+library(ggthemes)
+#install.packages("devtools")
+library(devtools)
+#install_github("https://github.com/juliasilge/silgelib")
+library(silgelib)
+#install.packages("tidymodels")
+library(tidymodels)
+install.packages("embed")
+library(embed)
+#install.packages("tzdb")
+library(tzdb)
+#install.packages("finetune")
+library(finetune)
+#install.packages("doParallel")
+#install.packages("lme4")
+library(lme4)
+#install.packages("xgboost")
+library(xgboost)
+#install.packages("vip")
+library(vip)
+#install.packages("vetiver")
+library(vetiver)
+theme_set(theme_minimal())
+update_geom_defaults("rect", list(fill = "midnightblue", alpha = 0.8))
+update_geom_defaults("rect", list(color = "midnightblue", alpha = 0.8))
+```
+
+Importing data.
+```{r}
+tornadoes <- readr::read_csv('https://raw.githubusercontent.com/rfordatascience/tidytuesday/master/data/2023/2023-05-16/tornados.csv')
+```
+
+Exploring data.
+```{r}
+tornadoes %>%
+  view()
+
+tornadoes %>%
+  str()
+
+tornadoes %>%
+  ggplot(aes(mag)) +
+  geom_bar() +
+  labs(x = "Magnitude",
+       y = "Count")
+
+tornadoes %>%
+  ggplot(aes(mag, fill = fc)) +
+  geom_bar(position = position_dodge(preserve = "single")) +
+  labs(x = "Magnitude",
+       y = "Count")
+
+tornadoes |>
+  ggplot(aes(mag, fill = fc)) +
+  geom_bar(position = position_dodge(preserve = "single")) +
+  labs(x = "Magnitude",
+       y = "Log count") +
+  scale_y_log10()
+
+tornadoes |>
+  group_by(st) |>
+  summarise(mag = mean(mag, na.rm = TRUE), n = n()) |>
+  arrange(-mag)
+
+tornados |>
+  filter(!is.na(mag)) |>
+  mutate(mag = factor(mag)) |>
+  ggplot(aes(mag, inj, fill = mag)) +
+  geom_boxplot(alpha = 0.6, show.legend = FALSE) +
+  scale_y_continuous(trans = scales::pseudo_log_trans(base = 10)) +
+  labs(x = "Magnitude",
+       y = "# of injuries")
+
+tornados |>
+  filter(!is.na(mag)) |>
+  mutate(mag = factor(mag)) |>
+  ggplot(aes(mag, fat, fill = mag)) +
+  geom_boxplot(alpha = 0.6, show.legend = FALSE) +
+  scale_y_continuous(trans = scales::pseudo_log_trans(base = 10)) +
+  labs(x = "Magnitude",
+       y = "# of fatalities")
+```
+
+Modeling time.
+
+First, we split our data.
+```{r}
+set.seed(123)
+
+tornado_split <- tornados |>
+  filter(!is.na(mag)) |>
+  initial_split(strata = mag)
+
+tornado_train <- training(tornado_split)
+tornado_test <- testing(tornado_split)
+
+set.seed(234)
+tornado_folds <- vfold_cv(tornado_train, strata = mag)
+tornado_folds
+```
+
+Feature engineering, building a recipe for our model (data spending).
+```{r}
+tornado_rec <- recipe(mag ~ date + st + inj + fat + len + wid, data = tornado_train) |>
+  step_lencode_glm(st, outcome = vars(mag)) |>
+  step_date(date, features = c("month", "year"), keep_original_cols = FALSE) |>
+  step_dummy(all_nominal_predictors())
+```
+
+Feature engineering.
+```{r}
+prep(tornado_rec) |>
+  bake(new_data = NULL) |>
+  glimpse()
+```
+
+
+Building model.
+```{r}
+xgb_spec <- boost_tree(
+  trees = tune(),
+  min_n = tune(),
+  mtry = tune(),
+  learn_rate = 0.01
+) |>
+  set_engine("xgboost") |>
+  set_mode("regression")
+
+xgb_wf <- workflow(tornado_rec, xgb_spec)
+```
+
+
+```{r}
+doParallel::registerDoParallel()
+collect_metrics(tornado_fit)
+collect_predictions(tornado_fit) |>
+  mutate(mag = factor(mag)) |>
+  ggplot(aes(mag, .pred, fill = mag)) +
+  geom_boxplot(alpha = 0.6, show.legend = FALSE)
+set.seed(345)
+
+xgb_rs <- tune_race_anova(
+  xgb_wf,
+  resamples = tornado_folds,
+  grid = 15,
+  control = control_race(verbose_elim = TRUE)
+)
+```
+
+
+```{r}
+collect_metrics(xgb_rs)
+
+plot_race(xgb_rs)
+```
+
+
+```{r}
+tornado_fit <- xgb_wf |>
+  finalize_workflow(select_best(xgb_rs, "rmse")) |>
+  last_fit(tornado_split)
+```
+
+```{r}
+collect_metrics(tornado_fit)
+
+
+collect_predictions(tornado_fit) |>
+  ggplot(aes(.pred)) +
+  geom_histogram(alpha = 0.6, show.legend = FALSE)
+
+#Below, we see that we've underpredicted mag of strong tornadoes, and over predicted mag of weak tornadoes.
+collect_predictions(tornado_fit) |>
+  mutate(mag = factor(mag)) |>
+  ggplot(aes(mag, .pred, fill = mag)) +
+  geom_boxplot(alpha = 0.6, show.legend = FALSE)
+
+#How important were our predictor variables?
+extract_workflow(tornado_fit) |>
+  extract_fit_parsnip() |>
+  vip(num_features = 10)
+```
+
+
+```{r}
+v <- extract_workflow(tornado_fit) |>
+  vetiver_model("tornadoe-xgb")
+
+v
+
+```
+
